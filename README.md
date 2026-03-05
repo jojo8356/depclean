@@ -30,6 +30,19 @@ Built in Rust for speed. Single binary, zero runtime dependencies, **~650 KB**.
 | C / C++ | `CMakeLists.txt` | `build/` |
 | .NET | `*.csproj`, `*.sln` | `bin/`, `obj/` |
 
+## Docker Support
+
+depclean also detects **unused Docker images** on your system. If Docker is installed and running, it will:
+
+1. List all Docker images
+2. Identify which images are **not used** by any container (running or stopped)
+3. Show unused images alongside project dependencies, sorted by size
+4. Delete selected images via `docker rmi`
+
+Docker images appear in the list with the `Docker` language tag. No configuration needed — if Docker isn't available, this step is silently skipped.
+
+> **Note:** Docker requires administrator privileges. Make sure your user is in the `docker` group or run depclean with `sudo`.
+
 <br>
 
 ## Installation

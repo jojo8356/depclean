@@ -15,6 +15,7 @@ use std::{
     fs,
     io::{self, stdout},
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -78,14 +79,22 @@ const LANG_RULES: &[LangRule] = &[
     },
 ];
 
+// --- Clean target ---
+
+#[derive(Clone)]
+enum CleanTarget {
+    Directories(Vec<PathBuf>),
+    DockerImage { id: String },
+}
+
 // --- Project entry ---
 
 #[derive(Clone)]
 struct Project {
-    path: PathBuf,
+    display_name: String,
     lang: &'static str,
     lang_color: Color,
-    dep_dirs: Vec<PathBuf>,
+    target: CleanTarget,
     size: u64,
     selected: bool,
 }
@@ -189,11 +198,16 @@ fn scan_projects(
             }
 
             if !dep_dirs.is_empty() {
+                let short_path = dir
+                    .to_str()
+                    .unwrap_or("")
+                    .replace(&dirs::home_dir_string(), "~");
+
                 let project = Project {
-                    path: dir.to_path_buf(),
+                    display_name: short_path,
                     lang: rule.name,
                     lang_color: rule.color,
-                    dep_dirs,
+                    target: CleanTarget::Directories(dep_dirs),
                     size: total_size,
                     selected: false,
                 };
@@ -203,7 +217,142 @@ fn scan_projects(
         }
     }
 
+    // Scan Docker images after filesystem scan
+    scan_docker_images(projects);
+
     scanning_done.store(true, Ordering::Relaxed);
+}
+
+// --- Docker scanning ---
+
+fn parse_docker_size(s: &str) -> u64 {
+    let s = s.trim();
+    // Docker outputs sizes like "123MB", "1.5GB", "45.3kB"
+    let (num_str, unit) = if s.ends_with("GB") {
+        (&s[..s.len() - 2], 1024u64 * 1024 * 1024)
+    } else if s.ends_with("MB") {
+        (&s[..s.len() - 2], 1024u64 * 1024)
+    } else if s.ends_with("kB") {
+        (&s[..s.len() - 2], 1024u64)
+    } else if s.ends_with("B") {
+        (&s[..s.len() - 1], 1u64)
+    } else {
+        return 0;
+    };
+
+    num_str
+        .trim()
+        .parse::<f64>()
+        .map(|n| (n * unit as f64) as u64)
+        .unwrap_or(0)
+}
+
+fn scan_docker_images(projects: &Arc<Mutex<Vec<Project>>>) {
+    // Check if docker is available
+    let images_output = match Command::new("docker")
+        .args(["images", "--format", "{{.ID}}\t{{.Repository}}\t{{.Tag}}\t{{.Size}}"])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return, // Docker not available or not running
+    };
+
+    // Get image IDs that are currently in use by containers
+    let used_ids: Vec<String> = Command::new("docker")
+        .args(["ps", "-a", "--format", "{{.Image}}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Also resolve used image names to IDs for accurate matching
+    let used_image_ids: Vec<String> = Command::new("docker")
+        .args(["ps", "-a", "--format", "{{.Image}}"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let names: Vec<String> = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|s| s.to_string())
+                .collect();
+            // Resolve each name/tag to an image ID
+            let mut ids = Vec::new();
+            for name in &names {
+                if let Ok(out) = Command::new("docker")
+                    .args(["inspect", "--format", "{{.Id}}", name])
+                    .output()
+                {
+                    if out.status.success() {
+                        let full_id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                        // Docker short IDs are 12 chars
+                        if full_id.starts_with("sha256:") {
+                            ids.push(full_id[7..19].to_string());
+                        } else if full_id.len() >= 12 {
+                            ids.push(full_id[..12].to_string());
+                        }
+                    }
+                }
+            }
+            ids
+        })
+        .unwrap_or_default();
+
+    let mut docker_projects = Vec::new();
+
+    for line in images_output.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let id = parts[0].trim();
+        let repo = parts[1].trim();
+        let tag = parts[2].trim();
+        let size_str = parts[3].trim();
+
+        // Check if this image is in use (by short ID or name)
+        let in_use = used_image_ids.iter().any(|uid| uid == id)
+            || used_ids.iter().any(|u| {
+                u == id
+                    || u == repo
+                    || *u == format!("{}:{}", repo, tag)
+            });
+
+        if in_use {
+            continue;
+        }
+
+        let display = if tag == "<none>" && repo == "<none>" {
+            format!("<dangling> {}", &id[..12.min(id.len())])
+        } else if tag == "<none>" {
+            repo.to_string()
+        } else {
+            format!("{}:{}", repo, tag)
+        };
+
+        let size = parse_docker_size(size_str);
+
+        docker_projects.push(Project {
+            display_name: display,
+            lang: "Docker",
+            lang_color: Color::LightBlue,
+            target: CleanTarget::DockerImage {
+                id: id.to_string(),
+            },
+            size,
+            selected: false,
+        });
+    }
+
+    if !docker_projects.is_empty() {
+        projects.lock().unwrap().extend(docker_projects);
+    }
 }
 
 // --- Size formatting ---
@@ -333,13 +482,17 @@ impl App {
 
     fn delete_selected(&mut self) {
         let projects = self.projects.lock().unwrap();
-        let to_delete: Vec<(usize, Vec<PathBuf>)> = projects
+        let to_delete: Vec<(usize, CleanTarget)> = projects
             .iter()
             .enumerate()
             .filter(|(_, p)| p.selected)
-            .map(|(i, p)| (i, p.dep_dirs.clone()))
+            .map(|(i, p)| (i, p.target.clone()))
             .collect();
-        let total = to_delete.iter().map(|(_, dirs)| dirs.len()).sum();
+
+        let total = to_delete.iter().map(|(_, t)| match t {
+            CleanTarget::Directories(dirs) => dirs.len(),
+            CleanTarget::DockerImage { .. } => 1,
+        }).sum();
         drop(projects);
 
         self.phase = AppPhase::Deleting { current: 0, total };
@@ -347,22 +500,56 @@ impl App {
         let mut freed: u64 = 0;
         let mut done = 0;
 
-        for (_proj_idx, dirs) in &to_delete {
-            for dir in dirs {
-                let size = dir_size(dir);
-                let _ = fs::remove_dir_all(dir);
-                freed += size;
-                done += 1;
-                self.phase = AppPhase::Deleting {
-                    current: done,
-                    total,
-                };
+        for (_proj_idx, target) in &to_delete {
+            match target {
+                CleanTarget::Directories(dirs) => {
+                    for dir in dirs {
+                        let size = dir_size(dir);
+                        let _ = fs::remove_dir_all(dir);
+                        freed += size;
+                        done += 1;
+                        self.phase = AppPhase::Deleting {
+                            current: done,
+                            total,
+                        };
+                    }
+                }
+                CleanTarget::DockerImage { id, .. } => {
+                    // Get size before removal (already stored in project)
+                    let size = self.projects.lock().unwrap()
+                        .iter()
+                        .find(|p| matches!(&p.target, CleanTarget::DockerImage { id: pid, .. } if pid == id))
+                        .map(|p| p.size)
+                        .unwrap_or(0);
+                    let _ = Command::new("docker").args(["rmi", id]).output();
+                    freed += size;
+                    done += 1;
+                    self.phase = AppPhase::Deleting {
+                        current: done,
+                        total,
+                    };
+                }
             }
         }
 
-        // Unselect and remove cleaned projects
+        // Remove cleaned entries
         let mut projects = self.projects.lock().unwrap();
-        projects.retain(|p| !p.selected || p.dep_dirs.iter().any(|d| d.exists()));
+        projects.retain(|p| {
+            if !p.selected {
+                return true;
+            }
+            match &p.target {
+                CleanTarget::Directories(dirs) => dirs.iter().any(|d| d.exists()),
+                CleanTarget::DockerImage { id, .. } => {
+                    // Check if image still exists
+                    Command::new("docker")
+                        .args(["inspect", "--type=image", id])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false)
+                }
+            }
+        });
         for p in projects.iter_mut() {
             p.selected = false;
         }
@@ -465,18 +652,17 @@ fn render_selecting(frame: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(Color::DarkGray)
             };
 
-            let short_path = p
-                .path
-                .to_str()
-                .unwrap_or("")
-                .replace(&dirs::home_dir_string(), "~");
+            let target_info = match &p.target {
+                CleanTarget::Directories(dirs) => format!("{} dirs", dirs.len()),
+                CleanTarget::DockerImage { .. } => "image".to_string(),
+            };
 
             Row::new(vec![
                 Cell::from(format!(" [{}]", check)).style(checkbox_style),
-                Cell::from(short_path),
+                Cell::from(p.display_name.clone()),
                 Cell::from(p.lang).style(Style::default().fg(p.lang_color)),
                 Cell::from(format_size(p.size)).style(Style::default().fg(Color::Yellow)),
-                Cell::from(format!("{} dirs", p.dep_dirs.len()))
+                Cell::from(target_info)
                     .style(Style::default().fg(Color::DarkGray)),
             ])
         })
@@ -578,7 +764,7 @@ fn render_deleting(frame: &mut Frame, area: Rect, current: usize, total: usize) 
         )
         .gauge_style(Style::default().fg(Color::Red))
         .ratio(ratio)
-        .label(format!("{}/{} directories", current, total));
+        .label(format!("{}/{} items", current, total));
 
     frame.render_widget(gauge, chunks[1]);
 }
@@ -615,6 +801,202 @@ fn render_done(frame: &mut Frame, area: Rect, freed: u64) {
 mod dirs {
     pub fn home_dir_string() -> String {
         std::env::var("HOME").unwrap_or_default()
+    }
+}
+
+// --- Tests ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    // --- parse_docker_size ---
+
+    #[test]
+    fn parse_docker_size_gb() {
+        assert_eq!(parse_docker_size("1.5GB"), (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+    }
+
+    #[test]
+    fn parse_docker_size_mb() {
+        assert_eq!(parse_docker_size("123MB"), (123.0 * 1024.0 * 1024.0) as u64);
+    }
+
+    #[test]
+    fn parse_docker_size_kb() {
+        assert_eq!(parse_docker_size("45.3kB"), (45.3 * 1024.0) as u64);
+    }
+
+    #[test]
+    fn parse_docker_size_bytes() {
+        assert_eq!(parse_docker_size("512B"), 512);
+    }
+
+    #[test]
+    fn parse_docker_size_zero_gb() {
+        assert_eq!(parse_docker_size("0GB"), 0);
+    }
+
+    #[test]
+    fn parse_docker_size_with_whitespace() {
+        assert_eq!(parse_docker_size("  256MB  "), (256.0 * 1024.0 * 1024.0) as u64);
+    }
+
+    #[test]
+    fn parse_docker_size_invalid() {
+        assert_eq!(parse_docker_size("invalid"), 0);
+        assert_eq!(parse_docker_size(""), 0);
+    }
+
+    #[test]
+    fn parse_docker_size_fractional_gb() {
+        assert_eq!(parse_docker_size("0.5GB"), (0.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+    }
+
+    // --- format_size ---
+
+    #[test]
+    fn format_size_bytes() {
+        assert_eq!(format_size(500), "500 B");
+    }
+
+    #[test]
+    fn format_size_kb() {
+        assert_eq!(format_size(2048), "2 KB");
+    }
+
+    #[test]
+    fn format_size_mb() {
+        assert_eq!(format_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn format_size_gb() {
+        assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2.0 GB");
+    }
+
+    #[test]
+    fn format_size_zero() {
+        assert_eq!(format_size(0), "0 B");
+    }
+
+    // --- matches_marker ---
+
+    #[test]
+    fn matches_marker_exact_file() {
+        let dir = tempdir();
+        fs::write(dir.join("Cargo.toml"), "").unwrap();
+        assert!(matches_marker(&dir, "Cargo.toml"));
+        assert!(!matches_marker(&dir, "package.json"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn matches_marker_wildcard() {
+        let dir = tempdir();
+        fs::write(dir.join("myapp.csproj"), "").unwrap();
+        assert!(matches_marker(&dir, "*.csproj"));
+        assert!(!matches_marker(&dir, "*.sln"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn matches_marker_empty_dir() {
+        let dir = tempdir();
+        assert!(!matches_marker(&dir, "Cargo.toml"));
+        assert!(!matches_marker(&dir, "*.csproj"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- dir_size ---
+
+    #[test]
+    fn dir_size_counts_files() {
+        let dir = tempdir();
+        fs::write(dir.join("a.txt"), "hello").unwrap(); // 5 bytes
+        fs::write(dir.join("b.txt"), "world!").unwrap(); // 6 bytes
+        assert_eq!(dir_size(&dir), 11);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dir_size_empty() {
+        let dir = tempdir();
+        assert_eq!(dir_size(&dir), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dir_size_nested() {
+        let dir = tempdir();
+        let sub = dir.join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("file.txt"), "abc").unwrap(); // 3 bytes
+        fs::write(dir.join("root.txt"), "de").unwrap(); // 2 bytes
+        assert_eq!(dir_size(&dir), 5);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- Docker display name logic ---
+
+    #[test]
+    fn docker_display_dangling_image() {
+        let repo = "<none>";
+        let tag = "<none>";
+        let id = "abc123def456";
+        let display = if tag == "<none>" && repo == "<none>" {
+            format!("<dangling> {}", &id[..12.min(id.len())])
+        } else if tag == "<none>" {
+            repo.to_string()
+        } else {
+            format!("{}:{}", repo, tag)
+        };
+        assert_eq!(display, "<dangling> abc123def456");
+    }
+
+    #[test]
+    fn docker_display_no_tag() {
+        let repo = "myimage";
+        let tag = "<none>";
+        let id = "abc123def456";
+        let display = if tag == "<none>" && repo == "<none>" {
+            format!("<dangling> {}", &id[..12.min(id.len())])
+        } else if tag == "<none>" {
+            repo.to_string()
+        } else {
+            format!("{}:{}", repo, tag)
+        };
+        assert_eq!(display, "myimage");
+    }
+
+    #[test]
+    fn docker_display_with_tag() {
+        let repo = "nginx";
+        let tag = "latest";
+        let id = "abc123def456";
+        let display = if tag == "<none>" && repo == "<none>" {
+            format!("<dangling> {}", &id[..12.min(id.len())])
+        } else if tag == "<none>" {
+            repo.to_string()
+        } else {
+            format!("{}:{}", repo, tag)
+        };
+        assert_eq!(display, "nginx:latest");
+    }
+
+    // --- Helper ---
+
+    fn tempdir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "depclean_test_{}_{}", std::process::id(), id
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
 
